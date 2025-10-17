@@ -91,6 +91,38 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
 
   # **** below this line need to be optional and benchmarked ****
 
+  # OPTIMIZATION: For medium-sized reductions on CPU, maximize vectorization
+  # Target: Single-kernel path (2M-10M) and split kernels (10M-20M)
+  if k.opts is not None and k.opts.device == "CPU" and k.reduceop is not None:
+    # Check if this is a full reduction (all axes being reduced)
+    is_full_reduce = len(k.axes_of(AxisType.REDUCE, AxisType.GROUP_REDUCE)) > 0 and len(k.axes_of(AxisType.GLOBAL)) == 0
+    # Also apply to partial reductions (not just full reductions)
+    is_partial_reduce = len(k.axes_of(AxisType.REDUCE, AxisType.GROUP_REDUCE)) > 0
+
+    if is_full_reduce or is_partial_reduce:
+      total_elements = prod(k.full_shape)
+      # For 2M-20M element reductions (single-kernel: 2M-10M, split: 10M-20M)
+      if 2000000 < total_elements < 20000000:
+        import platform
+        # ARM NEON works best with 128-bit vectors (4xfloat32)
+        # Single-kernel path (2M-10M) gets more aggressive vectorization
+        upcast_amounts = [16, 8, 4] if total_elements < 10000000 else [8, 4]
+
+        if platform.machine() in ['arm64', 'aarch64'] and k.upcastable_dims:
+          for upcast_amt in upcast_amounts:
+            try:
+              # Try both last dimension and reduce dimensions
+              for dim in k.upcastable_dims[-1:]:  # Focus on last dimension
+                if k.full_shape[dim] % upcast_amt == 0:
+                  k.apply_opt(Opt(OptOps.UPCAST, dim, upcast_amt))
+                  if DEBUG >= 3: print(f"CPU reduce vectorization: upcasting dim {dim} by {upcast_amt} ({total_elements} elements)")
+                  break
+              else:
+                continue
+              break  # Successfully applied, exit outer loop
+            except KernelOptError:
+              pass
+
   # if there are small dims with lots of valid masks, upcast them (they might be from Tensor.stack)
   to_upcast: list[int] = []
   # upcast leading axes first (hack-ish for winograd; we actually want to upcast masked axes with low stride first)

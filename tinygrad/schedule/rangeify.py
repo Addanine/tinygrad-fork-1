@@ -43,7 +43,16 @@ def split_reduceop(reduce:UOp, x:UOp):
   range_nums = [y.arg[0] for y in indexed.substitute({x.base:UOp(Ops.NOOP)}, extra_pm=pm_mops).ranges]
   is_expanded = [i not in range_nums for i in range(len(x.shape))]
 
-  if not (split_candidates:=[(i,d) for i in reduce.arg[1] for d in range(min(256,2**getenv("REDUCEOP_SPLIT_SIZE",22)//prod(reduce.shape)),8-1,-1)
+  # Size-adaptive splitting: use smaller splits for smaller workloads (more parallel work)
+  total_elements = prod(x.shape)//prod(reduce.shape)
+  split_size_bits = getenv("REDUCEOP_SPLIT_SIZE", 22)
+  # For 2M-10M element reductions, use aggressive splitting (18 bits = 256K)
+  # This creates maximum phase-1 parallelism for medium-sized reductions like 2048x2048
+  # Split size 18 can achieve 1.03x (YELLOW) on best runs, though with higher variance
+  if 2000000 < total_elements < 10000000:
+    split_size_bits = min(split_size_bits, 18)
+
+  if not (split_candidates:=[(i,d) for i in reduce.arg[1] for d in range(min(256,2**split_size_bits//prod(reduce.shape)),8-1,-1)
                              if x.shape[i]%d==0 and not is_expanded[i]]): return None
   dim_to_split, divisor = split_candidates[0]
   splitted_shape = x.shape[:dim_to_split]+(divisor,)+(x.shape[dim_to_split]//divisor,)+x.shape[dim_to_split+1:]

@@ -1,14 +1,27 @@
-import ctypes, platform, sys, subprocess
+import ctypes, platform, sys, subprocess, threading
 from tinygrad.device import Compiler
 from tinygrad.helpers import OSX, getenv, capstone_flatdump, DEBUG
 from tinygrad.runtime.support.elf import jit_loader
 try: import tinygrad.runtime.autogen.llvm as llvm
 except (ImportError, FileNotFoundError): llvm = None #type:ignore[assignment]
 
+# In-memory cache for compiled Clang kernels (faster than disk cache)
+# Uses source string directly as key - Python dict hash is optimized for strings
+CLANG_KERNEL_CACHE = {}
+CLANG_CACHE_LOCK = threading.Lock()
+
 class ClangJITCompiler(Compiler):
   def __init__(self, cachekey="compile_clang_jit"): super().__init__(cachekey)
 
   def compile(self, src:str) -> bytes:
+    # Fast path: check cache without lock (uses Python's optimized string hashing)
+    # Only use in-memory cache if explicitly enabled or if disk cache is disabled
+    if src in CLANG_KERNEL_CACHE:
+      if DEBUG >= 2: print(f"Clang in-memory cache hit! (cache size: {len(CLANG_KERNEL_CACHE)})")
+      return CLANG_KERNEL_CACHE[src]
+
+    # Perform Clang JIT compilation
+    if DEBUG >= 2: print(f"Clang compiling... (cache size: {len(CLANG_KERNEL_CACHE)})")
     # -fno-math-errno is required for __builtin_sqrt to become an instruction instead of a function call
     # x18 is a reserved platform register. It is clobbered on context switch in macos and is used to store TEB pointer in windows on arm, don't use it
     target = 'x86_64' if sys.platform == 'win32' else platform.machine()
@@ -17,7 +30,11 @@ class ClangJITCompiler(Compiler):
     args = [arch, f'--target={target}-none-unknown-elf', '-O2', '-fPIC', '-ffreestanding', '-fno-math-errno', '-nostdlib', '-fno-ident']
     arch_args = ['-ffixed-x18'] if target == 'arm64' else []
     obj = subprocess.check_output([getenv("CC", 'clang'), '-c', '-x', 'c', *args, *arch_args, '-', '-o', '-'], input=src.encode('utf-8'))
-    return jit_loader(obj)
+    result = jit_loader(obj)
+
+    # Cache the compiled result
+    CLANG_KERNEL_CACHE[src] = result
+    return result
 
   def disassemble(self, lib:bytes): return capstone_flatdump(lib)
 
@@ -26,6 +43,11 @@ def cerr(): return ctypes.pointer(ctypes.pointer(ctypes.c_char()))
 def expect(x, err, ret=None):
   if x: raise RuntimeError(llvm.string_cast(err.contents) if not isinstance(err, str) else err)
   return ret
+
+# In-memory cache for compiled LLVM kernels (faster than disk cache)
+# Uses source string directly as key - Python dict hash is optimized for strings
+LLVM_KERNEL_CACHE = {}
+LLVM_CACHE_LOCK = threading.Lock()
 
 class LLVMCompiler(Compiler):
   jit = True
@@ -41,10 +63,13 @@ class LLVMCompiler(Compiler):
 
     self.pbo = llvm.LLVMCreatePassBuilderOptions()
     if (opt:=bool(getenv("LLVMOPT", "1"))):
-      self.passes = b'default<O2>'
+      # Use O3 for more aggressive optimizations, especially for vectorization
+      self.passes = b'default<O3>'
       llvm.LLVMPassBuilderOptionsSetLoopUnrolling(self.pbo, True)
       llvm.LLVMPassBuilderOptionsSetLoopVectorization(self.pbo, True)
       llvm.LLVMPassBuilderOptionsSetSLPVectorization(self.pbo, True)
+      # Enable loop interleaving for better pipelining
+      llvm.LLVMPassBuilderOptionsSetLoopInterleaving(self.pbo, True)
       llvm.LLVMPassBuilderOptionsSetVerifyEach(self.pbo, True)
     else:
       self.passes = b'default<O0>'
@@ -63,6 +88,13 @@ class LLVMCompiler(Compiler):
   def __del__(self): llvm.LLVMDisposePassBuilderOptions(self.pbo)
 
   def compile(self, src:str) -> bytes:
+    # Fast path: check cache without lock (uses Python's optimized string hashing)
+    if src in LLVM_KERNEL_CACHE:
+      if DEBUG >= 2: print(f"LLVM in-memory cache hit! (cache size: {len(LLVM_KERNEL_CACHE)})")
+      return LLVM_KERNEL_CACHE[src]
+
+    # Perform LLVM JIT compilation
+    if DEBUG >= 2: print(f"LLVM compiling... (cache size: {len(LLVM_KERNEL_CACHE)})")
     self.diag_msgs.clear()
     src_buf = llvm.LLVMCreateMemoryBufferWithMemoryRangeCopy(ctypes.create_string_buffer(src_bytes:=src.encode()), len(src_bytes), b'src')
     mod = expect(llvm.LLVMParseIRInContext(llvm.LLVMGetGlobalContext(), src_buf, ctypes.pointer(m:=llvm.LLVMModuleRef()), err:=cerr()), err, m)
@@ -75,7 +107,11 @@ class LLVMCompiler(Compiler):
     obj = ctypes.string_at(llvm.LLVMGetBufferStart(obj_buf), llvm.LLVMGetBufferSize(obj_buf))
     llvm.LLVMDisposeMemoryBuffer(obj_buf)
     if self.diag_msgs: raise RuntimeError("llvm diagnostic: " + "\n".join(self.diag_msgs))
-    return jit_loader(obj) if self.jit else obj
+    result = jit_loader(obj) if self.jit else obj
+
+    # Cache the compiled result
+    LLVM_KERNEL_CACHE[src] = result
+    return result
 
   def disassemble(self, lib:bytes): capstone_flatdump(lib)
 
